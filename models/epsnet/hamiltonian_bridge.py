@@ -276,6 +276,9 @@ class HamiltonianBridgeNetwork(nn.Module):
                 pos_perturbed_grad = pos_perturbed.detach().requires_grad_(True)
                 _, physics_forces = self.physics_field(atom_type, pos_perturbed_grad, batch)
 
+            # Clamp forces to prevent numerical instability
+            physics_forces = torch.clamp(physics_forces, min=-10.0, max=10.0)
+
             # Add physics drift to the perturbed positions
             # This implements the Langevin reference SDE
             pos_perturbed = pos_perturbed + gamma_pos * physics_forces * (1.0 - a_pos)
@@ -426,6 +429,10 @@ class HamiltonianBridgeNetwork(nn.Module):
                     # Compute xTB forces - need to enable gradients temporarily
                     with torch.enable_grad():
                         _, physics_forces = self.physics_field(atom_type, pos, batch)
+
+                    # Clamp forces to prevent numerical instability
+                    # Typical noise predictions are O(1), so forces should be similar scale
+                    physics_forces = torch.clamp(physics_forces, min=-10.0, max=10.0)
 
                     # Combined: learned + physics
                     eps_total = eps_learned + gamma_pos * physics_forces * self.physics_weight

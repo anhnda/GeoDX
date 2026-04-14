@@ -136,8 +136,9 @@ class DXTBForceField(nn.Module):
 
         # Compute pairwise distances and energies
         # Use squared distances to avoid issues with torch.norm gradients
+        # NOTE: Much smaller epsilon to prevent force explosion
         sigma = 1.5  # Angstrom
-        epsilon = 0.1  # Energy unit
+        epsilon = 0.0001  # Energy unit (reduced from 0.1)
 
         total_energy = None
 
