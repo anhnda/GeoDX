@@ -87,8 +87,9 @@ class DXTBForceField(nn.Module):
             energy: scalar energy
             forces: (n, 3) forces
         """
-        # Enable gradient computation
-        positions = positions.clone().detach().requires_grad_(True)
+        # Ensure positions requires grad for force computation
+        if not positions.requires_grad:
+            positions = positions.clone().requires_grad_(True)
 
         # Convert atom types to atomic numbers if needed
         if atom_types.dtype == torch.long:
@@ -108,12 +109,13 @@ class DXTBForceField(nn.Module):
             inputs=positions,
             grad_outputs=grad_outputs,
             create_graph=True,
-            retain_graph=True
+            retain_graph=True,
+            allow_unused=False
         )[0]
 
         forces = -grads
 
-        return energy.detach(), forces
+        return energy, forces
 
     def _compute_xtb_energy_mock(self, atomic_numbers, positions):
         """
@@ -125,7 +127,9 @@ class DXTBForceField(nn.Module):
         # Simple harmonic potential as placeholder
         # E = sum of pairwise LJ-like interactions
         n_atoms = positions.size(0)
-        energy = 0.0
+
+        # Initialize as tensor to maintain gradient graph
+        energy = torch.zeros(1, device=positions.device, dtype=positions.dtype)
 
         for i in range(n_atoms):
             for j in range(i+1, n_atoms):
@@ -137,11 +141,7 @@ class DXTBForceField(nn.Module):
                 lj = 4 * epsilon * ((sigma/r)**12 - (sigma/r)**6)
                 energy = energy + lj
 
-        # Ensure energy is a scalar tensor on the right device
-        if not isinstance(energy, torch.Tensor):
-            energy = torch.tensor(energy, device=positions.device, dtype=positions.dtype)
-
-        return energy
+        return energy.squeeze()
 
 
 def compute_xtb_forces(atom_types, positions, batch=None, method='GFN2-xTB', device='cpu'):
