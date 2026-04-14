@@ -1,0 +1,72 @@
+# Configuration for Hamiltonian-Informed Schrödinger Bridge
+# Training on GEOM-QM9 dataset with physics-informed diffusion
+
+model:
+  network: hamiltonian_bridge
+  type: diffusion  # 'diffusion' for DDPM-style, 'dsm' for score matching
+
+  # Architecture
+  hidden_dim: 128
+  num_convs: 4
+  num_convs_local: 4
+  edge_order: 3
+  cutoff: 10.0
+  smooth_conv: True
+  mlp_act: relu
+  edge_encoder: gaussian
+
+  # Diffusion parameters
+  beta_schedule: sigmoid
+  beta_start: 1.0e-7
+  beta_end: 2.0e-3
+  num_diffusion_timesteps: 5000
+
+  # Physics-informed components (NEW)
+  use_physics: true
+  xtb_method: GFN2-xTB  # 'GFN1-xTB' or 'GFN2-xTB'
+
+  # Gamma scheduler for physics drift weight
+  gamma_schedule: cosine  # 'constant', 'linear', 'cosine', 'exponential', 'sigmoid'
+  gamma_start: 1.0  # Strong physics guidance at high noise
+  gamma_end: 0.01   # Weak physics at low noise (let model fine-tune)
+
+  # Warm-start configuration
+  warm_start_steps: 100  # xTB optimization steps for initialization
+  physics_weight: 0.5    # Weight of physics vs learned components during sampling
+
+dataset:
+  train: ./data/GEOM/QM9/train.pkl
+  val: ./data/GEOM/QM9/val.pkl
+
+train:
+  seed: 2024
+  batch_size: 64
+  max_iters: 1000000
+  val_freq: 10000
+  log_freq: 100
+
+  # Optimizer
+  optimizer:
+    type: adam
+    lr: 0.001
+    weight_decay: 0
+    beta1: 0.95
+    beta2: 0.999
+
+  # Scheduler
+  scheduler:
+    type: plateau  # 'plateau' or 'step' or 'cosine'
+    factor: 0.6
+    patience: 10
+    min_lr: 1.0e-6
+
+  # Training
+  max_grad_norm: 8.0
+  anneal_power: 2.0
+
+# Sampling configuration
+sampling:
+  n_steps: 5000  # Number of reverse diffusion steps
+  use_warm_start: true  # Use xTB warm-start initialization
+  batch_size: 32
+  num_samples: 2  # Number of samples per molecule
