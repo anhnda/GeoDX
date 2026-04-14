@@ -9,6 +9,7 @@ from math import pi as PI
 
 from utils.chem import BOND_TYPES
 from ..common import MeanReadout, SumReadout, MultiLayerPerceptron
+from .schnet import GaussianSmearing
 
 
 class GaussianSmearingEdgeEncoder(Module):
