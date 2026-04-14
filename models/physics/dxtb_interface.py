@@ -54,7 +54,7 @@ class DXTBForceField(nn.Module):
 
         n_graphs = batch.max().item() + 1
         energies = []
-        all_forces = []
+        all_forces = torch.zeros_like(positions)
 
         for i in range(n_graphs):
             mask = (batch == i)
@@ -65,15 +65,12 @@ class DXTBForceField(nn.Module):
             energy, forces = self._compute_single_molecule(mol_atom_types, mol_positions)
             energies.append(energy)
 
-            # Store forces in full tensor
-            mol_forces = torch.zeros_like(positions)
-            mol_forces[mask] = forces
-            all_forces.append(mol_forces)
+            # Store forces in the corresponding positions
+            all_forces[mask] = forces
 
         total_energy = torch.stack(energies)
-        total_forces = torch.stack(all_forces).sum(0)
 
-        return total_energy, total_forces
+        return total_energy, all_forces
 
     def _compute_single_molecule(self, atom_types, positions):
         """
@@ -87,9 +84,9 @@ class DXTBForceField(nn.Module):
             energy: scalar energy
             forces: (n, 3) forces
         """
-        # Ensure positions requires grad for force computation
-        if not positions.requires_grad:
-            positions = positions.clone().requires_grad_(True)
+        # Always clone positions and enable gradients for force computation
+        # This is necessary because input positions may be sliced from a larger tensor
+        positions_grad = positions.detach().clone().requires_grad_(True)
 
         # Convert atom types to atomic numbers if needed
         if atom_types.dtype == torch.long:
@@ -100,13 +97,13 @@ class DXTBForceField(nn.Module):
         # Compute energy using dxtb
         # Note: Actual dxtb API may vary, this is a placeholder
         # Real implementation would use: dxtb.Calculator(method=self.method)
-        energy = self._compute_xtb_energy_mock(atomic_numbers, positions)
+        energy = self._compute_xtb_energy_mock(atomic_numbers, positions_grad)
 
         # Compute forces as negative gradients
         grad_outputs = torch.ones_like(energy)
         grads = torch.autograd.grad(
             outputs=energy,
-            inputs=positions,
+            inputs=positions_grad,
             grad_outputs=grad_outputs,
             create_graph=True,
             retain_graph=True,
