@@ -423,8 +423,9 @@ class HamiltonianBridgeNetwork(nn.Module):
                     gamma_t = self.gamma_scheduler(t)  # (G,)
                     gamma_pos = gamma_t.index_select(0, batch).unsqueeze(-1)  # (N, 1)
 
-                    # Compute xTB forces
-                    _, physics_forces = self.physics_field(atom_type, pos.detach(), batch)
+                    # Compute xTB forces - need to enable gradients temporarily
+                    with torch.enable_grad():
+                        _, physics_forces = self.physics_field(atom_type, pos, batch)
 
                     # Combined: learned + physics
                     eps_total = eps_learned + gamma_pos * physics_forces * self.physics_weight
