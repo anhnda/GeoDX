@@ -102,16 +102,24 @@ def test_hamiltonian_bridge_network():
     device = 'cpu'
     model = HamiltonianBridgeNetwork(config).to(device)
 
-    # Create a simple molecule
-    atom_type = torch.tensor([6, 6, 8], dtype=torch.long)  # C-C-O
+    # Create a molecule with both bonded and non-bonded interactions
+    # Benzene-like ring: 6 carbons in a ring + 1 oxygen nearby but not bonded
+    atom_type = torch.tensor([6, 6, 6, 6, 8], dtype=torch.long)  # C-C-C-C chain + O
     pos = torch.tensor([
-        [0.0, 0.0, 0.0],
-        [1.5, 0.0, 0.0],
-        [2.25, 1.0, 0.0]
+        [0.0, 0.0, 0.0],   # C0
+        [1.5, 0.0, 0.0],   # C1 bonded to C0
+        [3.0, 0.0, 0.0],   # C2 bonded to C1
+        [4.5, 0.0, 0.0],   # C3 bonded to C2
+        [0.0, 2.0, 0.0]    # O not bonded, but within 5Å of C0,C1,C2
     ], dtype=torch.float32)
-    bond_index = torch.tensor([[0, 1], [1, 0], [1, 2], [2, 1]], dtype=torch.long).t()
-    bond_type = torch.tensor([1, 1, 1, 1], dtype=torch.long)  # Single bonds
-    batch = torch.zeros(3, dtype=torch.long)
+    # Bonds: C0-C1, C1-C2, C2-C3 (linear chain, O is separate)
+    bond_index = torch.tensor([
+        [0, 1], [1, 0],  # C0-C1
+        [1, 2], [2, 1],  # C1-C2
+        [2, 3], [3, 2]   # C2-C3
+    ], dtype=torch.long).t()
+    bond_type = torch.tensor([1, 1, 1, 1, 1, 1], dtype=torch.long)  # Single bonds
+    batch = torch.zeros(5, dtype=torch.long)
     time_step = torch.tensor([50], dtype=torch.long)
 
     # Test forward pass
@@ -137,7 +145,7 @@ def test_hamiltonian_bridge_network():
         bond_index=bond_index,
         bond_type=bond_type,
         batch=batch,
-        num_nodes_per_graph=torch.tensor([3]),
+        num_nodes_per_graph=torch.tensor([5]),
         num_graphs=1,
         anneal_power=2.0,
         return_unreduced_loss=False
@@ -149,7 +157,8 @@ def test_hamiltonian_bridge_network():
 
     assert not torch.isnan(loss), "Loss should not be NaN"
     assert not torch.isinf(loss), "Loss should not be Inf"
-    print("   ✓ HamiltonianBridgeNetwork passed")
+    assert loss_global.item() > 0, "Global loss should be > 0 for this test molecule"
+    print("   ✓ HamiltonianBridgeNetwork passed (both global and local losses active)")
 
 
 def test_sampling():
