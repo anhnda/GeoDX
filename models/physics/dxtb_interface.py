@@ -88,7 +88,7 @@ class DXTBForceField(nn.Module):
             forces: (n, 3) forces
         """
         # Enable gradient computation
-        positions = positions.requires_grad_(True)
+        positions = positions.clone().detach().requires_grad_(True)
 
         # Convert atom types to atomic numbers if needed
         if atom_types.dtype == torch.long:
@@ -102,13 +102,18 @@ class DXTBForceField(nn.Module):
         energy = self._compute_xtb_energy_mock(atomic_numbers, positions)
 
         # Compute forces as negative gradients
-        if positions.grad is not None:
-            positions.grad.zero_()
+        grad_outputs = torch.ones_like(energy)
+        grads = torch.autograd.grad(
+            outputs=energy,
+            inputs=positions,
+            grad_outputs=grad_outputs,
+            create_graph=True,
+            retain_graph=True
+        )[0]
 
-        energy.backward(retain_graph=True)
-        forces = -positions.grad.clone()
+        forces = -grads
 
-        return energy, forces
+        return energy.detach(), forces
 
     def _compute_xtb_energy_mock(self, atomic_numbers, positions):
         """
@@ -120,15 +125,21 @@ class DXTBForceField(nn.Module):
         # Simple harmonic potential as placeholder
         # E = sum of pairwise LJ-like interactions
         n_atoms = positions.size(0)
-        energy = torch.tensor(0.0, device=positions.device, requires_grad=True)
+        energy = 0.0
 
         for i in range(n_atoms):
             for j in range(i+1, n_atoms):
-                r = torch.norm(positions[i] - positions[j])
+                r_vec = positions[i] - positions[j]
+                r = torch.norm(r_vec) + 1e-6  # Add small epsilon for numerical stability
                 # Simple LJ-like potential: E = 4ε[(σ/r)^12 - (σ/r)^6]
                 sigma = 1.5  # Angstrom
                 epsilon = 0.1  # Energy unit
-                energy = energy + 4 * epsilon * ((sigma/r)**12 - (sigma/r)**6)
+                lj = 4 * epsilon * ((sigma/r)**12 - (sigma/r)**6)
+                energy = energy + lj
+
+        # Ensure energy is a scalar tensor on the right device
+        if not isinstance(energy, torch.Tensor):
+            energy = torch.tensor(energy, device=positions.device, dtype=positions.dtype)
 
         return energy
 
