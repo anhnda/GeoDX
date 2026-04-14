@@ -121,32 +121,44 @@ class DXTBForceField(nn.Module):
 
         For now, use a simple molecular mechanics approximation.
         """
+        # Ensure positions is a leaf tensor with gradients
+        assert positions.requires_grad, "Positions must require gradients"
+
         # Simple harmonic potential as placeholder
         # E = sum of pairwise LJ-like interactions
         n_atoms = positions.size(0)
 
-        # Collect all energy terms in a list and sum at the end
-        # This ensures proper gradient propagation
-        energy_terms = []
+        if n_atoms < 2:
+            # For single atom, return small energy that depends on positions
+            # This ensures gradient graph exists
+            energy = 0.001 * (positions**2).sum()
+            return energy
+
+        # Compute pairwise distances and energies
+        # Use squared distances to avoid issues with torch.norm gradients
+        sigma = 1.5  # Angstrom
+        epsilon = 0.1  # Energy unit
+
+        total_energy = None
 
         for i in range(n_atoms):
             for j in range(i+1, n_atoms):
+                # Compute distance
                 r_vec = positions[i] - positions[j]
-                r = torch.norm(r_vec) + 1e-6  # Add small epsilon for numerical stability
+                r_sq = (r_vec**2).sum() + 1e-8  # squared distance with epsilon
+                r = r_sq.sqrt()
+
                 # Simple LJ-like potential: E = 4ε[(σ/r)^12 - (σ/r)^6]
-                sigma = 1.5  # Angstrom
-                epsilon = 0.1  # Energy unit
-                lj = 4 * epsilon * ((sigma/r)**12 - (sigma/r)**6)
-                energy_terms.append(lj)
+                sigma_over_r = sigma / r
+                lj_energy = 4.0 * epsilon * (sigma_over_r**12 - sigma_over_r**6)
 
-        # Sum all energy terms - this maintains gradient graph
-        if len(energy_terms) > 0:
-            energy = torch.stack(energy_terms).sum()
-        else:
-            # For single atom, return zero energy with proper gradient tracking
-            energy = (positions**2).sum() * 0.0
+                # Accumulate energy
+                if total_energy is None:
+                    total_energy = lj_energy
+                else:
+                    total_energy = total_energy + lj_energy
 
-        return energy
+        return total_energy
 
 
 def compute_xtb_forces(atom_types, positions, batch=None, method='GFN2-xTB', device='cpu'):
