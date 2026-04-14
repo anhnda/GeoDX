@@ -128,8 +128,9 @@ class DXTBForceField(nn.Module):
         # E = sum of pairwise LJ-like interactions
         n_atoms = positions.size(0)
 
-        # Initialize as tensor to maintain gradient graph
-        energy = torch.zeros(1, device=positions.device, dtype=positions.dtype)
+        # Collect all energy terms in a list and sum at the end
+        # This ensures proper gradient propagation
+        energy_terms = []
 
         for i in range(n_atoms):
             for j in range(i+1, n_atoms):
@@ -139,9 +140,16 @@ class DXTBForceField(nn.Module):
                 sigma = 1.5  # Angstrom
                 epsilon = 0.1  # Energy unit
                 lj = 4 * epsilon * ((sigma/r)**12 - (sigma/r)**6)
-                energy = energy + lj
+                energy_terms.append(lj)
 
-        return energy.squeeze()
+        # Sum all energy terms - this maintains gradient graph
+        if len(energy_terms) > 0:
+            energy = torch.stack(energy_terms).sum()
+        else:
+            # For single atom, return zero energy with proper gradient tracking
+            energy = (positions**2).sum() * 0.0
+
+        return energy
 
 
 def compute_xtb_forces(atom_types, positions, batch=None, method='GFN2-xTB', device='cpu'):
