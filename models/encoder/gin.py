@@ -48,7 +48,7 @@ class GINEConv(MessagePassing):
 
         x_r = x[1]
         if x_r is not None:
-            out += (1 + self.eps) * x_r
+            out = out + (1 + self.eps) * x_r
 
         return self.nn(out)
 
@@ -107,7 +107,7 @@ class GINEncoder(torch.nn.Module):
                 hidden = self.activation(hidden)
             assert hidden.shape == conv_input.shape                
             if self.short_cut and hidden.shape == conv_input.shape:
-                hidden += conv_input
+                hidden = hidden + conv_input
 
             hiddens.append(hidden)
             conv_input = hidden
