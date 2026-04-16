@@ -35,8 +35,9 @@ model:
   physics_weight: 0.5    # Weight of physics vs learned components during sampling
 
 dataset:
-  train: ./data/GEOM/QM9/train.pkl
-  val: ./data/GEOM/QM9/val.pkl
+  train: /home/anhnda/GEOM/qm9_processed/train_data_40k.pkl
+  val: /home/anhnda/GEOM/qm9_processed/val_data_5k.pkl
+  test: /home/anhnda/GEOM/qm9_processed/test_data_1k.pkl
 
 train:
   seed: 2024
