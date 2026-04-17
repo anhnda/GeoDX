@@ -276,8 +276,9 @@ class HamiltonianBridgeNetwork(nn.Module):
                 pos_perturbed_grad = pos_perturbed.detach().requires_grad_(True)
                 _, physics_forces = self.physics_field(atom_type, pos_perturbed_grad, batch)
 
-            # Clamp forces to prevent numerical instability
-            physics_forces = torch.clamp(physics_forces, min=-10.0, max=10.0)
+            # Clamp forces to prevent numerical instability and DETACH
+            # Physics guides the transport (reference SDE), but gradients only flow through network
+            physics_forces = torch.clamp(physics_forces, min=-1.0, max=1.0).detach()
 
             # Add physics drift to the perturbed positions
             # This implements the Langevin reference SDE
@@ -304,7 +305,8 @@ class HamiltonianBridgeNetwork(nn.Module):
         d_perturbed = edge_length
 
         # Target: direction from perturbed to ground truth
-        d_target = (d_gt - d_perturbed) / (1.0 - a_edge).sqrt() * a_edge.sqrt()
+        # Add epsilon to prevent division by zero when a_edge → 1
+        d_target = (d_gt - d_perturbed) / ((1.0 - a_edge).sqrt() + 1e-8) * a_edge.sqrt()
 
         # Global loss
         global_mask = torch.logical_and(
@@ -431,8 +433,8 @@ class HamiltonianBridgeNetwork(nn.Module):
                         _, physics_forces = self.physics_field(atom_type, pos, batch)
 
                     # Clamp forces to prevent numerical instability
-                    # Typical noise predictions are O(1), so forces should be similar scale
-                    physics_forces = torch.clamp(physics_forces, min=-10.0, max=10.0)
+                    # Tighter clamping for stable sampling
+                    physics_forces = torch.clamp(physics_forces, min=-1.0, max=1.0)
 
                     # Combined: learned + physics
                     eps_total = eps_learned + gamma_pos * physics_forces * self.physics_weight
