@@ -1,34 +1,60 @@
 """
 Precompute xTB forces and geometries for Hamiltonian-Informed Schrödinger Bridge.
 
-This script precomputes xTB energies and forces for the entire dataset offline,
-so that training does not need to call xTB at every step.
+Run ONCE before training. Saves per-sample .pt files to disk so that
+get_loss() can load forces instantly instead of calling xTB every step.
 
-Usage:
-    python precompute_xtb.py configs/hamiltonian.yml --split train
-    python precompute_xtb.py configs/hamiltonian.yml --split val
-    python precompute_xtb.py configs/hamiltonian.yml --split test
-    python precompute_xtb.py configs/hamiltonian.yml --split all --benchmark
-    python precompute_xtb.py configs/hamiltonian.yml --compare --drugs_cache /path/to/drugs/cache
+Usage
+-----
+# Precompute all splits (recommended):
+python precompute_xtb.py configs/hamiltonian.yml --split all
 
-Output structure:
-    {dataset_dir}/xtb_cache/
-        train/
-            00000000.pt   # per-sample cache
-            00000001.pt
-            ...
-            meta.pt       # split-level statistics
-        val/
-            ...
-        test/
-            ...
-        correction_comparison.pt   # QM9 vs Drugs analysis (if --compare)
+# Single split:
+python precompute_xtb.py configs/hamiltonian.yml --split train
+python precompute_xtb.py configs/hamiltonian.yml --split val
+python precompute_xtb.py configs/hamiltonian.yml --split test
+
+# Benchmark speedup after precomputing:
+python precompute_xtb.py configs/hamiltonian.yml --split train --benchmark
+
+# Compare QM9 vs Drugs correction statistics (empirical Claim 2):
+python precompute_xtb.py configs/hamiltonian.yml --compare \
+    --drugs_cache /path/to/drugs/xtb_cache/train
+
+Output layout
+-------------
+<dataset_dir>/xtb_cache/
+    train/
+        00000000.pt        # per-sample cache
+        00000001.pt
+        ...
+        meta.pt            # split-level statistics
+    val/  ...
+    test/ ...
+correction_comparison.pt   # QM9 vs Drugs analysis (--compare only)
+
+Each per-sample .pt contains:
+    pos_dft          (N, 3)  original DFT geometry
+    pos_warm         (N, 3)  xTB-optimised warm-start geometry
+    atom_type        (N,)
+    xtb_energy_eq    ()      xTB energy at DFT geometry
+    xtb_forces_eq    (N, 3)  xTB forces at DFT geometry
+    xtb_energy_warm  ()      xTB energy at warm-start geometry
+    xtb_forces_warm  (N, 3)  xTB forces at warm-start geometry  <-- used in training
+    correction       (N, 3)  pos_dft - pos_warm
+    correction_norm  ()      mean per-atom correction distance (Angstrom)
+
+In training, replace:
+    _, forces = self.physics_field(atom_type, pos, batch)   # SLOW
+with:
+    forces = batch.xtb_forces_warm                          # FREE
 """
 
 import os
 import argparse
 import yaml
 import time
+import shutil
 from easydict import EasyDict
 from tqdm.auto import tqdm
 from glob import glob
@@ -42,403 +68,379 @@ from utils.misc import get_logger, seed_all
 from models.physics import DXTBForceField, WarmStartOptimizer
 
 
-# ---------------------------------------------------------------------------
-# Path helpers
-# ---------------------------------------------------------------------------
+# ============================================================
+#  Path helpers
+# ============================================================
 
 def get_cache_dir(config, split):
-    """Return the cache directory for a given split, next to the dataset."""
+    """Cache directory lives next to the dataset files."""
     base = os.path.dirname(config.dataset.train)
     return os.path.join(base, 'xtb_cache', split)
 
 
 def sample_path(cache_dir, idx):
-    """Per-sample cache file path."""
     return os.path.join(cache_dir, f'{idx:08d}.pt')
 
 
-def already_done(cache_dir, n_samples):
-    """Count how many samples are already cached."""
-    return sum(
-        1 for i in range(n_samples)
-        if os.path.exists(sample_path(cache_dir, i))
-    )
+def count_done(cache_dir, n):
+    return sum(1 for i in range(n) if os.path.exists(sample_path(cache_dir, i)))
 
 
-# ---------------------------------------------------------------------------
-# Per-sample precomputation
-# ---------------------------------------------------------------------------
+# ============================================================
+#  Build physics modules  (same config keys as train.py)
+# ============================================================
 
-def precompute_sample(idx, data, physics_field, warm_start_opt,
-                      cache_dir, config, logger, device):
+def build_physics(config, device):
+    method     = config.model.get('xtb_method', 'GFN2-xTB')
+    max_steps  = config.model.get('warm_start_steps', 100)
+    field      = DXTBForceField(method=method, device=device)
+    warm_opt   = WarmStartOptimizer(method=method, max_steps=max_steps)
+    return field, warm_opt
+
+
+# ============================================================
+#  Single-sample precomputation
+# ============================================================
+
+def precompute_one(idx, data, field, warm_opt, cache_dir, device):
     """
-    Precompute and cache xTB data for a single molecule.
+    Compute and save xTB data for one molecule.
 
-    Saves:
-        pos_dft          : original DFT equilibrium geometry
-        pos_warm         : xTB warm-start optimized geometry
-        atom_type        : atom types
-        xtb_energy_eq    : xTB energy at DFT geometry
-        xtb_forces_eq    : xTB forces at DFT geometry
-        xtb_energy_warm  : xTB energy at warm-start geometry
-        xtb_forces_warm  : xTB forces at warm-start geometry  <- used in training
-        correction       : C_DFT - C_xTB  (for Claim 2 analysis)
-        correction_norm  : mean ||C_DFT - C_xTB|| per atom
+    Returns True on success, False on xTB failure (logged by caller).
     """
-    out_path = sample_path(cache_dir, idx)
-    if os.path.exists(out_path):
-        return True   # already cached — skip
+    out = sample_path(cache_dir, idx)
+    if os.path.exists(out):
+        return True, 'cached'
 
     try:
-        atom_type = data.atom_type.to(device)
-        pos_dft   = data.pos.to(device)
-        batch     = torch.zeros(atom_type.size(0), dtype=torch.long, device=device)
+        atom_type = data.atom_type.to(device)           # (N,)
+        pos_dft   = data.pos.to(device)                 # (N, 3)
+        batch     = torch.zeros(
+            atom_type.size(0), dtype=torch.long, device=device
+        )
 
-        # ------------------------------------------------------------------
-        # 1. xTB energy + forces at DFT geometry
-        #    → used for correction analysis (C_DFT vs C_xTB)
-        # ------------------------------------------------------------------
+        # ------------------------------------------------
+        # 1. xTB energy + forces at the DFT geometry
+        #    Used for correction-analysis (Claim 2)
+        # ------------------------------------------------
         with torch.no_grad():
-            energy_eq, forces_eq = physics_field(atom_type, pos_dft, batch)
+            energy_eq, forces_eq = field(atom_type, pos_dft, batch)
 
-        # ------------------------------------------------------------------
-        # 2. xTB warm-start geometry
-        #    Optimize from DFT geometry + small noise → nearest xTB minimum
-        # ------------------------------------------------------------------
+        # ------------------------------------------------
+        # 2. xTB warm-start optimisation
+        #    Small random perturbation → optimise to xTB minimum
+        # ------------------------------------------------
         pos_init = pos_dft + torch.randn_like(pos_dft) * 0.1
         with torch.no_grad():
-            pos_warm, _ = warm_start_opt.optimize(atom_type, pos_init, batch, device)
+            pos_warm, _ = warm_opt.optimize(atom_type, pos_init, batch, device)
 
-        # ------------------------------------------------------------------
+        # ------------------------------------------------
         # 3. xTB energy + forces at warm-start geometry
-        #    → used as physics guidance signal during training
-        # ------------------------------------------------------------------
+        #    PRIMARY signal used during training
+        # ------------------------------------------------
         with torch.no_grad():
-            energy_warm, forces_warm = physics_field(atom_type, pos_warm, batch)
+            energy_warm, forces_warm = field(atom_type, pos_warm, batch)
 
-        # ------------------------------------------------------------------
-        # 4. Correction vector  (DFT geometry − xTB geometry)
-        #    → empirical evidence for Claim 2: "gap is consistent across domains"
-        # ------------------------------------------------------------------
-        correction      = pos_dft - pos_warm               # (N, 3)
-        correction_norm = correction.norm(dim=-1).mean()   # scalar
+        # ------------------------------------------------
+        # 4. Correction vector  (DFT − xTB)
+        #    Empirical evidence for transfer assumption
+        # ------------------------------------------------
+        correction      = pos_dft - pos_warm              # (N, 3)
+        correction_norm = correction.norm(dim=-1).mean()  # scalar Å
 
         torch.save({
-            # geometries
             'pos_dft':          pos_dft.cpu(),
             'pos_warm':         pos_warm.cpu(),
             'atom_type':        atom_type.cpu(),
-            # xTB at DFT geometry
             'xtb_energy_eq':    energy_eq.cpu(),
             'xtb_forces_eq':    forces_eq.cpu(),
-            # xTB at warm-start geometry  (primary training signal)
             'xtb_energy_warm':  energy_warm.cpu(),
             'xtb_forces_warm':  forces_warm.cpu(),
-            # correction analysis
             'correction':       correction.cpu(),
             'correction_norm':  correction_norm.cpu(),
-        }, out_path)
+        }, out)
 
-        return True
+        return True, 'ok'
 
     except Exception as e:
-        logger.warning(f'[Sample {idx:08d}] xTB failed: {e}')
-        return False
+        return False, str(e)
 
 
-# ---------------------------------------------------------------------------
-# Full split precomputation
-# ---------------------------------------------------------------------------
+# ============================================================
+#  Full split precomputation
+# ============================================================
 
 def precompute_split(config, split, device, logger, resume=True):
     """
     Precompute xTB data for an entire dataset split.
 
-    Args:
-        config  : EasyDict config (same YAML as train.py)
-        split   : 'train' | 'val' | 'test'
-        device  : torch device string
-        logger  : logger instance
-        resume  : if True, skip already-cached samples
+    Parameters
+    ----------
+    config  : EasyDict  (same YAML as train.py)
+    split   : 'train' | 'val' | 'test'
+    device  : str
+    logger  : logging.Logger
+    resume  : bool  — skip already-cached samples
 
-    Returns:
-        cache_dir : path to the cache directory
+    Returns
+    -------
+    cache_dir : str
     """
 
-    # Dataset
+    # ---- dataset ----
     dataset_path = getattr(config.dataset, split)
-    logger.info(f'Loading {split} dataset from: {dataset_path}')
-    transforms = CountNodesPerGraph()
-    dataset    = ConformationDataset(dataset_path, transform=transforms)
-    n_samples  = len(dataset)
-    logger.info(f'{split} set size: {n_samples}')
+    logger.info(f'Loading {split} dataset: {dataset_path}')
+    dataset   = ConformationDataset(dataset_path, transform=CountNodesPerGraph())
+    n_samples = len(dataset)
+    logger.info(f'{split} size: {n_samples}')
 
-    # Cache directory
+    # ---- cache dir ----
     cache_dir = get_cache_dir(config, split)
     os.makedirs(cache_dir, exist_ok=True)
-    logger.info(f'Cache directory: {cache_dir}')
+    logger.info(f'Cache dir: {cache_dir}')
 
+    # ---- resume ----
     if resume:
-        n_done = already_done(cache_dir, n_samples)
+        n_done = count_done(cache_dir, n_samples)
         logger.info(f'Already cached: {n_done}/{n_samples}')
         if n_done == n_samples:
-            logger.info('All samples already cached. Skipping computation.')
+            logger.info('All done — skipping xTB computation.')
             _save_meta(cache_dir, n_samples, split, logger)
             return cache_dir
 
-    # Physics modules  (identical config keys as train.py)
-    logger.info(f'Initializing xTB method: {config.model.get("xtb_method", "GFN2-xTB")}')
-    physics_field  = DXTBForceField(
-        method=config.model.get('xtb_method', 'GFN2-xTB'),
-        device=device,
-    )
-    warm_start_opt = WarmStartOptimizer(
-        method=config.model.get('xtb_method', 'GFN2-xTB'),
-        max_steps=config.model.get('warm_start_steps', 100),
-    )
+    # ---- physics ----
+    logger.info(f'xTB method : {config.model.get("xtb_method", "GFN2-xTB")}')
+    logger.info(f'Warm steps : {config.model.get("warm_start_steps", 100)}')
+    field, warm_opt = build_physics(config, device)
 
-    # Per-sample loop
-    # Intentionally single-sample (not batched):
-    # xTB call overhead is per-molecule, not per-batch; batching adds
-    # bookkeeping complexity with no throughput benefit here.
-    n_success = 0
-    n_failed  = 0
-    t_start   = time.time()
+    # ---- per-sample loop ----
+    # Intentionally NOT batched: xTB overhead is per-molecule; batching
+    # adds bookkeeping without throughput gain for this use case.
+    n_ok     = 0
+    n_fail   = 0
+    t_start  = time.time()
 
-    for idx in tqdm(range(n_samples), desc=f'xTB precompute [{split}]'):
-        data = dataset[idx]
-
-        ok = precompute_sample(
-            idx=idx,
-            data=data,
-            physics_field=physics_field,
-            warm_start_opt=warm_start_opt,
-            cache_dir=cache_dir,
-            config=config,
-            logger=logger,
-            device=device,
+    for idx in tqdm(range(n_samples), desc=f'xTB [{split}]'):
+        data    = dataset[idx]
+        ok, msg = precompute_one(
+            idx, data, field, warm_opt, cache_dir, device
         )
-
         if ok:
-            n_success += 1
+            n_ok += 1
         else:
-            n_failed += 1
+            n_fail += 1
+            logger.warning(f'[{idx:08d}] FAILED: {msg}')
 
-        # Progress every 1000 samples
+        # ---- progress every 1000 ----
         if (idx + 1) % 1000 == 0:
             elapsed   = time.time() - t_start
-            rate      = (idx + 1) / elapsed
-            remaining = (n_samples - idx - 1) / max(rate, 1e-6)
+            rate      = (idx + 1) / max(elapsed, 1e-6)
+            eta_min   = (n_samples - idx - 1) / rate / 60.0
             logger.info(
                 f'[{split}] {idx+1}/{n_samples} | '
-                f'Success {n_success} | Failed {n_failed} | '
-                f'Rate {rate:.1f} mol/s | ETA {remaining/60:.1f} min'
+                f'OK {n_ok} | Fail {n_fail} | '
+                f'{rate:.1f} mol/s | ETA {eta_min:.1f} min'
             )
 
     logger.info(
-        f'[{split}] Finished. '
-        f'Success: {n_success}/{n_samples} | Failed: {n_failed}/{n_samples}'
+        f'[{split}] Finished — '
+        f'OK: {n_ok}/{n_samples} | Failed: {n_fail}/{n_samples}'
     )
 
-    # Aggregate metadata for analysis
     _save_meta(cache_dir, n_samples, split, logger)
-
     return cache_dir
 
 
-# ---------------------------------------------------------------------------
-# Metadata / statistics
-# ---------------------------------------------------------------------------
+# ============================================================
+#  Meta-statistics  (aggregated over a split)
+# ============================================================
+
+def _stats(lst):
+    if not lst:
+        return {}
+    t = torch.tensor(lst, dtype=torch.float32)
+    return dict(mean=t.mean().item(), std=t.std().item(),
+                min=t.min().item(),  max=t.max().item())
+
 
 def _save_meta(cache_dir, n_samples, split, logger):
     """
-    Aggregate per-sample statistics into a single meta.pt file.
+    Aggregate per-sample scalars into meta.pt.
 
-    The correction_norm statistics directly support Claim 2:
-        "xTB→DFT correction is consistent across molecular families"
-    Compare meta.pt from QM9 and Drugs caches to verify.
+    correction_norm statistics are the key output for Claim 2:
+        "xTB→DFT correction is consistent across molecular families."
+    Compare meta.pt files from QM9 and Drugs caches to verify.
     """
-    logger.info(f'Computing meta-statistics for {split}...')
+    logger.info(f'Computing meta-statistics for {split} ...')
 
-    correction_norms = []
-    force_norms_eq   = []
-    force_norms_warm = []
-    energies_eq      = []
-    energies_warm    = []
+    corr_norms    = []
+    fnorm_eq      = []
+    fnorm_warm    = []
+    energies_eq   = []
+    energies_warm = []
 
-    for idx in tqdm(range(n_samples), desc='Meta stats', leave=False):
-        path = sample_path(cache_dir, idx)
-        if not os.path.exists(path):
+    for idx in tqdm(range(n_samples), desc='meta', leave=False):
+        p = sample_path(cache_dir, idx)
+        if not os.path.exists(p):
             continue
-        d = torch.load(path, map_location='cpu')
-
-        correction_norms.append(d['correction_norm'].item())
-        force_norms_eq.append(d['xtb_forces_eq'].norm(dim=-1).mean().item())
-        force_norms_warm.append(d['xtb_forces_warm'].norm(dim=-1).mean().item())
-
+        d = torch.load(p, map_location='cpu')
+        corr_norms.append(d['correction_norm'].item())
+        fnorm_eq.append(d['xtb_forces_eq'].norm(dim=-1).mean().item())
+        fnorm_warm.append(d['xtb_forces_warm'].norm(dim=-1).mean().item())
         if d['xtb_energy_eq'].numel() == 1:
             energies_eq.append(d['xtb_energy_eq'].item())
             energies_warm.append(d['xtb_energy_warm'].item())
 
-    def _stats(lst):
-        if not lst:
-            return {}
-        t = torch.tensor(lst)
-        return {
-            'mean': t.mean().item(),
-            'std':  t.std().item(),
-            'min':  t.min().item(),
-            'max':  t.max().item(),
-        }
-
     meta = {
         'split':           split,
         'n_samples':       n_samples,
-        'n_cached':        len(correction_norms),
-        'correction_norm': _stats(correction_norms),
-        'force_norm_eq':   _stats(force_norms_eq),
-        'force_norm_warm': _stats(force_norms_warm),
+        'n_cached':        len(corr_norms),
+        'correction_norm': _stats(corr_norms),
+        'force_norm_eq':   _stats(fnorm_eq),
+        'force_norm_warm': _stats(fnorm_warm),
         'energy_eq':       _stats(energies_eq),
         'energy_warm':     _stats(energies_warm),
     }
-
     meta_path = os.path.join(cache_dir, 'meta.pt')
     torch.save(meta, meta_path)
 
+    cn = meta['correction_norm']
     logger.info(
-        f'[{split}] Correction norm — '
-        f'mean={meta["correction_norm"].get("mean", float("nan")):.4f} Å  '
-        f'std={meta["correction_norm"].get("std", float("nan")):.4f} Å'
+        f'[{split}] Correction norm (DFT-xTB) — '
+        f'mean={cn.get("mean", float("nan")):.4f} Å  '
+        f'std={cn.get("std",  float("nan")):.4f} Å'
     )
     logger.info(f'Meta saved: {meta_path}')
 
 
-# ---------------------------------------------------------------------------
-# Speed benchmark: online xTB vs cached disk load
-# ---------------------------------------------------------------------------
+# ============================================================
+#  Speed benchmark
+# ============================================================
 
-def benchmark(config, device, logger, n_runs=20):
+def run_benchmark(config, device, logger, n_runs=20):
     """
-    Measure online xTB time vs cached load time and print speedup.
-    Run after precomputing the train split.
+    Measure online xTB time vs. cached disk-load time.
+    Call after precomputing the train split.
     """
-    transforms = CountNodesPerGraph()
-    dataset    = ConformationDataset(config.dataset.train, transform=transforms)
-    cache_dir  = get_cache_dir(config, 'train')
-
-    physics_field = DXTBForceField(
-        method=config.model.get('xtb_method', 'GFN2-xTB'),
-        device=device,
+    dataset   = ConformationDataset(
+        config.dataset.train, transform=CountNodesPerGraph()
     )
+    cache_dir = get_cache_dir(config, 'train')
+    field, _  = build_physics(config, device)
 
     data      = dataset[0]
     atom_type = data.atom_type.to(device)
     pos       = data.pos.to(device)
     batch     = torch.zeros(atom_type.size(0), dtype=torch.long, device=device)
+    n_atoms   = atom_type.size(0)
 
-    logger.info(f'Benchmarking on molecule with {atom_type.size(0)} atoms, {n_runs} runs...')
+    logger.info(f'Benchmark molecule: {n_atoms} atoms | {n_runs} runs')
 
-    # Online xTB
+    # online xTB
     t0 = time.time()
     for _ in range(n_runs):
         with torch.no_grad():
-            physics_field(atom_type, pos, batch)
+            field(atom_type, pos, batch)
     online_ms = (time.time() - t0) / n_runs * 1000
 
-    # Cached load
-    cached_path = sample_path(cache_dir, 0)
-    if not os.path.exists(cached_path):
-        logger.warning('No cached sample found at index 0. Run precompute first.')
+    # cached load
+    cached_p = sample_path(cache_dir, 0)
+    if not os.path.exists(cached_p):
+        logger.warning('No cached sample found. Run precompute first.')
         return
 
     t0 = time.time()
     for _ in range(n_runs):
-        torch.load(cached_path, map_location='cpu')
+        torch.load(cached_p, map_location='cpu')
     cached_ms = (time.time() - t0) / n_runs * 1000
 
     speedup = online_ms / max(cached_ms, 1e-6)
-
     logger.info('=' * 50)
-    logger.info(f'Online xTB:   {online_ms:.1f} ms/mol')
-    logger.info(f'Cached load:  {cached_ms:.1f} ms/mol')
-    logger.info(f'Speedup:      {speedup:.0f}x')
+    logger.info(f'Online xTB  : {online_ms:.1f} ms/mol')
+    logger.info(f'Cached load : {cached_ms:.1f} ms/mol')
+    logger.info(f'Speedup     : {speedup:.0f}x')
     logger.info('=' * 50)
 
 
-# ---------------------------------------------------------------------------
-# Empirical Claim 2 validation: compare QM9 vs Drugs correction statistics
-# ---------------------------------------------------------------------------
+# ============================================================
+#  Empirical Claim 2 — QM9 vs Drugs correction comparison
+# ============================================================
 
 def compare_corrections(qm9_cache_dir, drugs_cache_dir, logger):
     """
-    Compare xTB→DFT correction norms between QM9 and Drugs splits.
+    Compare per-atom xTB→DFT correction norms between QM9 and Drugs.
 
-    Directly tests: "Is the xTB→DFT correction consistent across domains?"
+    This directly tests:
+        "Is the xTB→DFT correction consistent across molecular families?"
 
-    Interpretation:
+    Output:
         ratio ≈ 1.0  →  supports transfer assumption
-        ratio >> 1.0 →  assumption is violated for Drugs
+        ratio >> 1.0 →  assumption breaks for Drugs
     """
-    def load_corrections(cache_dir):
+    def load_norms(cache_dir):
         files = sorted(glob(os.path.join(cache_dir, '????????.pt')))
         norms = []
-        for f in tqdm(files, desc=f'Loading {os.path.basename(cache_dir)}'):
+        for f in tqdm(files, desc=os.path.basename(cache_dir), leave=False):
             d = torch.load(f, map_location='cpu')
             if 'correction_norm' in d:
                 norms.append(d['correction_norm'].item())
-        return torch.tensor(norms)
+        return torch.tensor(norms, dtype=torch.float32)
 
     logger.info('=' * 60)
-    logger.info('Empirical Claim 2: QM9 vs Drugs correction comparison')
+    logger.info('Claim 2 empirical check: QM9 vs Drugs correction norms')
     logger.info('=' * 60)
 
-    qm9_norms   = load_corrections(qm9_cache_dir)
-    drugs_norms = load_corrections(drugs_cache_dir)
+    qm9   = load_norms(qm9_cache_dir)
+    drugs = load_norms(drugs_cache_dir)
 
-    logger.info(f'QM9   | n={len(qm9_norms):6d} | '
-                f'mean={qm9_norms.mean():.4f} Å | '
-                f'std={qm9_norms.std():.4f} Å')
-    logger.info(f'Drugs | n={len(drugs_norms):6d} | '
-                f'mean={drugs_norms.mean():.4f} Å | '
-                f'std={drugs_norms.std():.4f} Å')
+    logger.info(
+        f'QM9   n={len(qm9):6d} | '
+        f'mean={qm9.mean():.4f} Å | std={qm9.std():.4f} Å'
+    )
+    logger.info(
+        f'Drugs n={len(drugs):6d} | '
+        f'mean={drugs.mean():.4f} Å | std={drugs.std():.4f} Å'
+    )
 
-    ratio = qm9_norms.mean() / (drugs_norms.mean() + 1e-8)
-    logger.info(f'Ratio QM9/Drugs: {ratio:.3f}  '
-                f'(1.0 = identical correction scale = supports transfer)')
+    ratio = qm9.mean() / (drugs.mean() + 1e-8)
+    logger.info(
+        f'Ratio QM9/Drugs = {ratio:.3f}  '
+        f'(1.0 = same scale = supports transfer; '
+        f'>>1 or <<1 = assumption violated)'
+    )
 
-    out = {
-        'qm9_correction_norms':   qm9_norms,
-        'drugs_correction_norms': drugs_norms,
-        'qm9_mean':    qm9_norms.mean().item(),
-        'drugs_mean':  drugs_norms.mean().item(),
-        'ratio':       ratio.item(),
-    }
     out_path = 'correction_comparison.pt'
-    torch.save(out, out_path)
+    torch.save({
+        'qm9_correction_norms':   qm9,
+        'drugs_correction_norms': drugs,
+        'qm9_mean':               qm9.mean().item(),
+        'drugs_mean':             drugs.mean().item(),
+        'ratio':                  ratio.item(),
+    }, out_path)
     logger.info(f'Saved: {out_path}')
     logger.info('=' * 60)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# ============================================================
+#  Entry point
+# ============================================================
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Precompute xTB forces for Hamiltonian Bridge training'
+        description='Precompute xTB forces/geometries for Hamiltonian Bridge'
     )
     parser.add_argument(
         'config', type=str,
-        help='Path to config YAML (same file used for train.py)'
+        help='Path to YAML config (same file used for train.py)'
     )
     parser.add_argument(
         '--split', type=str, default='all',
         choices=['train', 'val', 'test', 'all'],
-        help='Which split to precompute (default: all)'
+        help='Dataset split to precompute (default: all)'
     )
     parser.add_argument(
         '--device', type=str, default='cpu',
-        help='Device for xTB computation (cpu recommended, xTB is not GPU-native)'
+        help='Device for xTB (cpu recommended — xTB is not GPU-native)'
     )
     parser.add_argument(
         '--logdir', type=str, default='./logs_precompute',
@@ -450,7 +452,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--benchmark', action='store_true',
-        help='After precomputing, benchmark online xTB vs cached load speed'
+        help='Benchmark online xTB vs cached load after precomputing'
     )
     parser.add_argument(
         '--compare', action='store_true',
@@ -458,36 +460,34 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--drugs_cache', type=str, default=None,
-        help='Path to Drugs xtb_cache/train directory (for --compare)'
+        help='Path to Drugs xtb_cache/train dir (used with --compare)'
     )
     args = parser.parse_args()
 
-    # Config  (identical loading pattern to train.py)
+    # ---- config (identical pattern to train.py) ----
     with open(args.config, 'r') as f:
         config = EasyDict(yaml.safe_load(f))
-
     seed_all(config.train.seed)
 
-    # Logging
+    # ---- logging ----
     os.makedirs(args.logdir, exist_ok=True)
     logger = get_logger('precompute_xtb', args.logdir)
 
     logger.info('=' * 80)
     logger.info('xTB Precomputation — Hamiltonian-Informed Schrödinger Bridge')
     logger.info('=' * 80)
-    logger.info(f'Config:      {args.config}')
-    logger.info(f'Device:      {args.device}')
-    logger.info(f'xTB method:  {config.model.get("xtb_method", "GFN2-xTB")}')
-    logger.info(f'Warm steps:  {config.model.get("warm_start_steps", 100)}')
-    logger.info(f'Split:       {args.split}')
-    logger.info(f'Resume:      {not args.no_resume}')
+    logger.info(f'Config      : {args.config}')
+    logger.info(f'Device      : {args.device}')
+    logger.info(f'xTB method  : {config.model.get("xtb_method", "GFN2-xTB")}')
+    logger.info(f'Warm steps  : {config.model.get("warm_start_steps", 100)}')
+    logger.info(f'Split       : {args.split}')
+    logger.info(f'Resume      : {not args.no_resume}')
     logger.info('=' * 80)
 
-    # Precompute
+    # ---- precompute ----
     splits = ['train', 'val', 'test'] if args.split == 'all' else [args.split]
-
     for split in splits:
-        logger.info(f'\n{"=" * 40}  {split}  {"=" * 40}')
+        logger.info(f'\n{"=" * 35}  {split}  {"=" * 35}')
         precompute_split(
             config=config,
             split=split,
@@ -496,12 +496,12 @@ if __name__ == '__main__':
             resume=not args.no_resume,
         )
 
-    # Benchmark (optional)
+    # ---- benchmark ----
     if args.benchmark:
-        logger.info('\nRunning speed benchmark...')
-        benchmark(config, args.device, logger)
+        logger.info('\nRunning speed benchmark ...')
+        run_benchmark(config, args.device, logger)
 
-    # Compare QM9 vs Drugs (optional — empirical Claim 2 validation)
+    # ---- compare ----
     if args.compare:
         if args.drugs_cache is None:
             logger.warning('--drugs_cache not provided. Skipping comparison.')
@@ -509,10 +509,11 @@ if __name__ == '__main__':
             qm9_cache = get_cache_dir(config, 'train')
             compare_corrections(qm9_cache, args.drugs_cache, logger)
 
-    logger.info('\nDone.')
+    logger.info('\nAll done.')
     logger.info(
-        '\nTo use cached forces in training, replace:\n'
-        '    _, forces = self.physics_field(atom_type, pos, batch)\n'
-        'with:\n'
-        '    forces = batch.xtb_forces_warm   # free — loaded from disk\n'
+        '\nTo use cached forces in training, replace in get_loss():\n'
+        '    with torch.set_grad_enabled(True):\n'
+        '        _, physics_forces = self.physics_field(atom_type, pos_perturbed_grad, batch)\n'
+        '\nwith:\n'
+        '    physics_forces = batch.xtb_forces_warm   # preloaded, ~0 cost\n'
     )
