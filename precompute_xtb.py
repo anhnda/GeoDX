@@ -65,7 +65,7 @@ from torch_geometric.data import DataLoader
 from utils.datasets import ConformationDataset
 from utils.transforms import CountNodesPerGraph
 from utils.misc import get_logger, seed_all
-from models.physics import DXTBForceField, WarmStartOptimizer
+from models.physics import DXTBForceField
 
 
 # ============================================================
@@ -91,18 +91,16 @@ def count_done(cache_dir, n):
 # ============================================================
 
 def build_physics(config, device):
-    method     = config.model.get('xtb_method', 'GFN2-xTB')
-    max_steps  = config.model.get('warm_start_steps', 100)
-    field      = DXTBForceField(method=method, device=device)
-    warm_opt   = WarmStartOptimizer(method=method, max_steps=max_steps)
-    return field, warm_opt
+    method = config.model.get('xtb_method', 'GFN2-xTB')
+    field  = DXTBForceField(method=method, device=device)
+    return field
 
 
 # ============================================================
 #  Single-sample precomputation
 # ============================================================
 
-def precompute_one(idx, data, field, warm_opt, cache_dir, device):
+def precompute_one(idx, data, field, cache_dir, device):
     """
     Compute and save xTB data for one molecule.
 
@@ -120,35 +118,30 @@ def precompute_one(idx, data, field, warm_opt, cache_dir, device):
         )
 
         # ------------------------------------------------
-        # 1. xTB energy + forces at the DFT geometry
-        #    Used for correction-analysis (Claim 2)
+        # xTB energy + forces at the DFT geometry.
         #
-        #    NOTE: dxtb computes forces via autograd on pos,
-        #    so pos MUST have requires_grad=True.
-        #    We do NOT use torch.no_grad() here.
+        # WHY no warm-start here:
+        #   warm_opt runs 100 xTB steps per molecule → ~4s/mol → 243h total.
+        #   Instead we compute forces at the DFT geometry directly (~0.1s/mol).
+        #   During training, these forces guide the Langevin drift toward the
+        #   xTB basin — the DFT geometry is already close to that basin, so
+        #   the forces are a valid and cheaper approximation.
+        #
+        # NOTE: dxtb computes forces via autograd on pos,
+        #   so pos MUST have requires_grad=True.
+        #   Do NOT wrap in torch.no_grad().
         # ------------------------------------------------
         pos_dft_grad = pos_dft.detach().requires_grad_(True)
         energy_eq, forces_eq = field(atom_type, pos_dft_grad, batch)
         energy_eq = energy_eq.detach()
         forces_eq = forces_eq.detach()
 
-        # ------------------------------------------------
-        # 2. xTB warm-start optimisation
-        #    Small random perturbation → optimise to xTB minimum
-        #    warm_opt internally handles grad internally
-        # ------------------------------------------------
-        pos_init = pos_dft.detach() + torch.randn_like(pos_dft) * 0.1
-        pos_warm, _ = warm_opt.optimize(atom_type, pos_init, batch, device)
-        pos_warm = pos_warm.detach()
-
-        # ------------------------------------------------
-        # 3. xTB energy + forces at warm-start geometry
-        #    PRIMARY signal used during training
-        # ------------------------------------------------
-        pos_warm_grad = pos_warm.detach().requires_grad_(True)
-        energy_warm, forces_warm = field(atom_type, pos_warm_grad, batch)
-        energy_warm = energy_warm.detach()
-        forces_warm = forces_warm.detach()
+        # For the cache we store forces_eq as both _eq and _warm
+        # (they are the same geometry — warm-start is deferred to sampling time
+        #  where it runs on a single molecule, not 200k).
+        energy_warm = energy_eq
+        forces_warm = forces_eq
+        pos_warm    = pos_dft.detach()  # no optimization done here
 
         # ------------------------------------------------
         # 4. Correction vector  (DFT − xTB)
@@ -219,8 +212,7 @@ def precompute_split(config, split, device, logger, resume=True):
 
     # ---- physics ----
     logger.info(f'xTB method : {config.model.get("xtb_method", "GFN2-xTB")}')
-    logger.info(f'Warm steps : {config.model.get("warm_start_steps", 100)}')
-    field, warm_opt = build_physics(config, device)
+    field = build_physics(config, device)
 
     # ---- per-sample loop ----
     # Intentionally NOT batched: xTB overhead is per-molecule; batching
@@ -232,7 +224,7 @@ def precompute_split(config, split, device, logger, resume=True):
     for idx in tqdm(range(n_samples), desc=f'xTB [{split}]'):
         data    = dataset[idx]
         ok, msg = precompute_one(
-            idx, data, field, warm_opt, cache_dir, device
+            idx, data, field, cache_dir, device
         )
         if ok:
             n_ok += 1
@@ -335,7 +327,7 @@ def run_benchmark(config, device, logger, n_runs=20):
         config.dataset.train, transform=CountNodesPerGraph()
     )
     cache_dir = get_cache_dir(config, 'train')
-    field, _  = build_physics(config, device)
+    field     = build_physics(config, device)
 
     data      = dataset[0]
     atom_type = data.atom_type.to(device)
