@@ -122,24 +122,33 @@ def precompute_one(idx, data, field, warm_opt, cache_dir, device):
         # ------------------------------------------------
         # 1. xTB energy + forces at the DFT geometry
         #    Used for correction-analysis (Claim 2)
+        #
+        #    NOTE: dxtb computes forces via autograd on pos,
+        #    so pos MUST have requires_grad=True.
+        #    We do NOT use torch.no_grad() here.
         # ------------------------------------------------
-        with torch.no_grad():
-            energy_eq, forces_eq = field(atom_type, pos_dft, batch)
+        pos_dft_grad = pos_dft.detach().requires_grad_(True)
+        energy_eq, forces_eq = field(atom_type, pos_dft_grad, batch)
+        energy_eq = energy_eq.detach()
+        forces_eq = forces_eq.detach()
 
         # ------------------------------------------------
         # 2. xTB warm-start optimisation
         #    Small random perturbation → optimise to xTB minimum
+        #    warm_opt internally handles grad internally
         # ------------------------------------------------
-        pos_init = pos_dft + torch.randn_like(pos_dft) * 0.1
-        with torch.no_grad():
-            pos_warm, _ = warm_opt.optimize(atom_type, pos_init, batch, device)
+        pos_init = pos_dft.detach() + torch.randn_like(pos_dft) * 0.1
+        pos_warm, _ = warm_opt.optimize(atom_type, pos_init, batch, device)
+        pos_warm = pos_warm.detach()
 
         # ------------------------------------------------
         # 3. xTB energy + forces at warm-start geometry
         #    PRIMARY signal used during training
         # ------------------------------------------------
-        with torch.no_grad():
-            energy_warm, forces_warm = field(atom_type, pos_warm, batch)
+        pos_warm_grad = pos_warm.detach().requires_grad_(True)
+        energy_warm, forces_warm = field(atom_type, pos_warm_grad, batch)
+        energy_warm = energy_warm.detach()
+        forces_warm = forces_warm.detach()
 
         # ------------------------------------------------
         # 4. Correction vector  (DFT − xTB)
@@ -336,11 +345,12 @@ def run_benchmark(config, device, logger, n_runs=20):
 
     logger.info(f'Benchmark molecule: {n_atoms} atoms | {n_runs} runs')
 
-    # online xTB
+    # online xTB  (needs grad for force computation)
     t0 = time.time()
     for _ in range(n_runs):
-        with torch.no_grad():
-            field(atom_type, pos, batch)
+        pos_g = pos.detach().requires_grad_(True)
+        energy, forces = field(atom_type, pos_g, batch)
+        forces = forces.detach()
     online_ms = (time.time() - t0) / n_runs * 1000
 
     # cached load
